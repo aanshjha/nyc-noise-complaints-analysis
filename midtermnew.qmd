@@ -1,0 +1,302 @@
+---
+title: "NYC Noise Complaints: Response-Time Analysis"
+subtitle: "Midterm project"
+author: "Aansh Jha"
+date: "2024-12-09"
+date-format: "MMMM D, YYYY"
+format:
+  pdf:
+    pdf-engine: tectonic
+    toc: true
+    number-sections: true
+    geometry:
+      - margin=0.85in
+    colorlinks: true
+    fig-pos: H
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  error: false
+  cache: false
+---
+
+# Research question
+
+How do complaint type, borough, timing, and location relate to the time the New
+York Police Department (NYPD) takes to close NYC 311 noise complaints? The
+analysis focuses on complaints created from June 30 through July 6, 2024 and
+uses a two-hour closure threshold as the binary modeling outcome.
+
+The source is NYC Open Data's
+[311 Service Requests from 2020 to Present](https://data.cityofnewyork.us/d/erm2-nwe9).
+The repository includes a fixed CSV snapshot so the results below do not change
+when the live dataset is revised.
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+import sys
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+PROJECT_ROOT = Path.cwd()
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from analysis import (
+    DATA_PATH,
+    clean_complaints,
+    fit_response_model,
+    load_raw_data,
+    response_summary,
+    test_group_differences,
+)
+
+plt.style.use("seaborn-v0_8-whitegrid")
+pd.set_option("display.max_columns", 12)
+pd.set_option("display.width", 100)
+```
+
+# Data cleaning
+
+```{python}
+#| label: load-clean
+raw = load_raw_data(DATA_PATH)
+complaints, audit = clean_complaints(raw)
+
+pd.DataFrame(
+    {
+        "Measure": [
+            "Raw rows",
+            "Duplicate unique keys removed",
+            "Rows with invalid/missing dates removed",
+            "Rows with negative response times removed",
+            "Analysis rows",
+        ],
+        "Count": [
+            audit.raw_rows,
+            audit.duplicate_rows,
+            audit.invalid_date_rows,
+            audit.negative_response_rows,
+            audit.analysis_rows,
+        ],
+    }
+)
+```
+
+Column names are normalized to snake case, dates are parsed explicitly, and
+records without a valid creation/closure pair are excluded. `unique_key` is
+used for de-duplication. ZIP codes remain strings so leading zeroes cannot be
+lost. Unlike the earlier draft, this workflow makes no live geocoding calls and
+does not rely on the obsolete `uszipcode` database.
+
+```{python}
+#| label: data-quality
+pd.DataFrame(
+    {
+        "Field": ["borough", "complaint_type", "incident_zip", "latitude", "longitude"],
+        "Missing": [complaints[c].isna().sum() for c in [
+            "borough", "complaint_type", "incident_zip", "latitude", "longitude"
+        ]],
+    }
+)
+```
+
+# Descriptive analysis
+
+```{python}
+#| label: overall-summary
+overall = complaints["response_time_hours"].describe(
+    percentiles=[0.25, 0.5, 0.75, 0.9, 0.95]
+)
+overall.to_frame("Response time (hours)").round(2)
+```
+
+Response times are right-skewed, so medians and interquartile ranges are more
+representative than means. The figure caps the display at the 99th percentile;
+all valid rows remain in the statistics and model.
+
+The median closure time is `{python} f"{complaints['response_time_hours'].median():.2f}"`
+hours, and `{python} f"{complaints['over_two_hours'].mean():.1%}"` of complaints
+take at least two hours to close.
+
+```{python}
+#| label: response-distribution
+#| fig-cap: "Distribution of NYPD noise-complaint closure times. The x-axis is limited to the 99th percentile for readability."
+#| fig-width: 7.2
+#| fig-height: 4.2
+cap = complaints["response_time_hours"].quantile(0.99)
+fig, ax = plt.subplots()
+ax.hist(
+    complaints.loc[complaints["response_time_hours"] <= cap, "response_time_hours"],
+    bins=35,
+    color="#28666e",
+    edgecolor="white",
+)
+ax.axvline(2, color="#b23a48", linestyle="--", linewidth=2, label="Two-hour threshold")
+ax.set(xlabel="Closure time (hours)", ylabel="Complaints")
+ax.legend(frameon=False)
+plt.show()
+```
+
+```{python}
+#| label: borough-summary
+borough_summary = response_summary(complaints, "borough")
+borough_summary.round({"median_hours": 2, "mean_hours": 2, "over_two_hour_rate": 3})
+```
+
+```{python}
+#| label: complaint-summary
+complaint_summary = response_summary(complaints, "complaint_type")
+complaint_summary.round({"median_hours": 2, "mean_hours": 2, "over_two_hour_rate": 3})
+```
+
+```{python}
+#| label: borough-plot
+#| fig-cap: "Share of complaints closed in two hours or more, by borough (95% normal-approximation intervals)."
+#| fig-width: 7.2
+#| fig-height: 4.3
+plot_data = borough_summary.sort_values("over_two_hour_rate")
+rate = plot_data["over_two_hour_rate"]
+se = (rate * (1 - rate) / plot_data["n"]).pow(0.5)
+
+fig, ax = plt.subplots()
+ax.barh(plot_data["borough"], rate, color="#7c9885")
+ax.errorbar(rate, plot_data["borough"], xerr=1.96 * se, fmt="none", color="#1f2933")
+ax.set(xlabel="Proportion closed in 2+ hours", ylabel="")
+ax.set_xlim(left=0)
+plt.show()
+```
+
+The Bronx has the largest observed two-hour rate
+(`{python} f"{borough_summary.set_index('borough').loc['BRONX', 'over_two_hour_rate']:.1%}"`),
+while Staten Island has the smallest
+(`{python} f"{borough_summary.set_index('borough').loc['STATEN ISLAND', 'over_two_hour_rate']:.1%}"`).
+These differences are descriptive and are not adjusted estimates.
+
+# Group comparisons
+
+Because closure times are strongly skewed, the analysis uses Kruskal-Wallis
+tests instead of one-way ANOVA. The chi-square tests assess whether the binary
+two-hour outcome is independent of each grouping variable. Cramer's V reports
+effect size, which is more informative than a p-value alone in a large sample.
+
+```{python}
+#| label: inference
+tests = test_group_differences(complaints)
+test_display = tests.copy()
+test_display["statistic"] = test_display["statistic"].map(lambda value: f"{value:.2f}")
+test_display["p_value"] = test_display["p_value"].map(
+    lambda value: "<0.0001" if value < 0.0001 else f"{value:.4f}"
+)
+test_display["effect_size"] = test_display["effect_size"].map(
+    lambda value: "-" if pd.isna(value) else f"{value:.3f}"
+)
+test_display
+```
+
+These are associational tests, not causal estimates. A small p-value indicates
+that the observed distributions differ, but it does not establish that borough
+or complaint type causes a slower closure.
+
+# Predictive model
+
+A logistic regression predicts whether closure takes at least two hours. The
+features are available when a complaint is created: borough, complaint type,
+submission channel, hour, weekday/weekend status, and coordinates. The split is
+stratified and reproducible. Numeric features are median-imputed and scaled;
+categorical features are most-frequent-imputed and one-hot encoded. Class
+weights reduce the tendency to predict only the majority class.
+
+```{python}
+#| label: fit-model
+model_result = fit_response_model(complaints, random_state=42)
+pd.DataFrame(
+    {
+        "Metric": ["Accuracy", "Balanced accuracy", "Precision", "Recall", "F1", "ROC AUC"],
+        "Value": [
+            model_result.metrics["accuracy"],
+            model_result.metrics["balanced_accuracy"],
+            model_result.metrics["precision"],
+            model_result.metrics["recall"],
+            model_result.metrics["f1"],
+            model_result.metrics["roc_auc"],
+        ],
+    }
+).round(3)
+```
+
+On the test set, the model's ROC AUC is
+`{python} f"{model_result.metrics['roc_auc']:.3f}"` and its balanced accuracy is
+`{python} f"{model_result.metrics['balanced_accuracy']:.3f}"`. Weighting the
+classes raises recall for two-hour cases to
+`{python} f"{model_result.metrics['recall']:.1%}"`, with lower precision as the
+tradeoff.
+
+```{python}
+#| label: confusion-matrix
+pd.DataFrame(
+    model_result.confusion_matrix,
+    index=["Actual <2 hours", "Actual 2+ hours"],
+    columns=["Predicted <2 hours", "Predicted 2+ hours"],
+)
+```
+
+```{python}
+#| label: roc-plot
+#| fig-cap: "Receiver operating characteristic curve on the held-out test set."
+#| fig-width: 6.2
+#| fig-height: 4.4
+fig, ax = plt.subplots()
+ax.plot(model_result.fpr, model_result.tpr, color="#28666e", linewidth=2,
+        label=f"Logistic regression (AUC = {model_result.metrics['roc_auc']:.2f})")
+ax.plot([0, 1], [0, 1], color="#6b7280", linestyle="--", label="Random classifier")
+ax.set(xlabel="False-positive rate", ylabel="True-positive rate", xlim=(0, 1), ylim=(0, 1))
+ax.legend(frameon=False, loc="lower right")
+plt.show()
+```
+
+```{python}
+#| label: coefficients
+pd.concat(
+    [
+        model_result.coefficients.nsmallest(6, "coefficient"),
+        model_result.coefficients.nlargest(6, "coefficient"),
+    ]
+).drop_duplicates().sort_values("coefficient").round(3)
+```
+
+Coefficients describe conditional associations on the log-odds scale. They
+should not be interpreted as causal effects, and the model should not be used
+to rank neighborhoods or allocate enforcement resources without a fairness and
+drift review.
+
+# Conclusions and limitations
+
+The typical complaint closes in well under two hours, but the distribution has
+a long right tail. Two-hour closure rates vary substantially by borough, with
+the Bronx and Queens above the citywide sample rate and Staten Island,
+Manhattan, and Brooklyn below it. The group tests reject equal distributions,
+although their effect sizes are modest. The logistic model has useful but
+limited discrimination and should be treated as a descriptive baseline rather
+than a production system.
+
+Important limitations are:
+
+1. Closure time is an administrative measure; it is not the same as time to
+   resolve the underlying noise problem.
+2. The seven-day sample may reflect a holiday-week pattern and cannot establish
+   long-run seasonality.
+3. Complaint records measure reports to 311, not the true prevalence of noise.
+4. NYC Open Data can be revised after publication; the committed snapshot is
+   therefore the reproducibility reference for this report.
+5. Unmeasured operational factors may explain observed geographic differences.
+
+# Reproducibility
+
+The repository contains the fixed raw snapshot, data-download script, reusable
+analysis functions, dependency specification, tests, and rendering commands.
+Run `make test` to verify the transformations and `make render` to recreate this
+PDF. See `README.md` for complete setup instructions.

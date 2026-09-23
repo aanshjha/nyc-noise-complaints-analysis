@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+.quarto/
+.jupyter_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+midtermnew_files/
+midtermnew.tex
+tmp/
